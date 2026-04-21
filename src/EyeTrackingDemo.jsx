@@ -849,7 +849,7 @@ function ResultsPanel({ chunks, heatPoints = [], onRetry, onDownload }) {
   const s          = buildSummary(chunks);
   const heatResRef = useRef(null);
   const heatOffRef = useRef(null);
-  const trail      = chunks.filter(c=>c.gazeCenter).map(c=>({ x:c.gazeCenter.x, y:c.gazeCenter.y, zone:c.zone, susp:c.suspicion, label:c.timeLabel }));
+  // const trail      = chunks.filter(c=>c.gazeCenter).map(c=>({ x:c.gazeCenter.x, y:c.gazeCenter.y, zone:c.zone, susp:c.suspicion, label:c.timeLabel }));
 
   useEffect(() => {
     const dc = heatResRef.current;
