@@ -6,8 +6,12 @@ const LM = {
   RIGHT_IRIS: [473, 474, 475, 476, 477],
   L_INNER: 133, L_OUTER: 33,
   R_INNER: 362, R_OUTER: 263,
-  L_LID_TOP: 159, L_LID_BOT: 145,
-  R_LID_TOP: 386, R_LID_BOT: 374,
+  // Two points per lid edge → averaged for stability
+  L_LID_TOP: 159, L_LID_TOP2: 158,
+  L_LID_BOT: 145, L_LID_BOT2: 153,
+  R_LID_TOP: 386, R_LID_TOP2: 385,
+  R_LID_BOT: 374, R_LID_BOT2: 380,
+  // EAR helpers (kept exactly as before)
   L_TOP: [386, 374], L_BOT: [380, 373],
   R_TOP: [159, 158], R_BOT: [153, 145],
   NOSE_TIP: 1, CHIN: 152,
@@ -37,6 +41,7 @@ function irisCenter(lm, idxs) {
   return { x: x / idxs.length, y: y / idxs.length };
 }
 
+// ─── FEATURE EXTRACTION (vertical accuracy fixes here) ────────────────────────
 function extractFeatures(lm) {
   const li = irisCenter(lm, LM.LEFT_IRIS);
   const ri = irisCenter(lm, LM.RIGHT_IRIS);
@@ -45,22 +50,32 @@ function extractFeatures(lm) {
   const rIn = lm[LM.R_INNER], rOut = lm[LM.R_OUTER];
   const lw  = dist(lIn, lOut) || 0.001;
   const rw  = dist(rIn, rOut) || 0.001;
-
   const lCx = (lIn.x + lOut.x) / 2;
   const rCx = (rIn.x + rOut.x) / 2;
 
-  const lLidTop = lm[LM.L_LID_TOP], lLidBot = lm[LM.L_LID_BOT];
-  const rLidTop = lm[LM.R_LID_TOP], rLidBot = lm[LM.R_LID_BOT];
-  const lh = dist(lLidTop, lLidBot) || 0.001;
-  const rh = dist(rLidTop, rLidBot) || 0.001;
-  const lMidY = (lLidTop.y + lLidBot.y) / 2;
-  const rMidY = (rLidTop.y + rLidBot.y) / 2;
+  // ── FIX 1: Average two lid points per edge for smoother vertical reference ──
+  const lTopY = (lm[LM.L_LID_TOP].y + lm[LM.L_LID_TOP2].y) / 2;
+  const lBotY = (lm[LM.L_LID_BOT].y + lm[LM.L_LID_BOT2].y) / 2;
+  const rTopY = (lm[LM.R_LID_TOP].y + lm[LM.R_LID_TOP2].y) / 2;
+  const rBotY = (lm[LM.R_LID_BOT].y + lm[LM.R_LID_BOT2].y) / 2;
+  const lMidY = (lTopY + lBotY) / 2;
+  const rMidY = (rTopY + rBotY) / 2;
 
-  const lOffX = (li.x - lCx)    / lw;
-  const lOffY = (li.y - lMidY)  / lh;
-  const rOffX = (ri.x - rCx)    / rw;
-  const rOffY = (ri.y - rMidY)  / rh;
+  // ── Horizontal offset: normalized by eye width (was correct before) ─────────
+  const lOffX = (li.x - lCx) / lw;
+  const rOffX = (ri.x - rCx) / rw;
 
+  // ── FIX 2: Vertical offset normalized by eye WIDTH not eye HEIGHT ────────────
+  // Old: (li.y - lMidY) / lh  — bad because lh shrinks when you look down
+  // New: (li.y - lMidY) / lw  — lw is stable regardless of gaze direction
+  const lOffY = (li.y - lMidY) / lw;
+  const rOffY = (ri.y - rMidY) / rw;
+
+  // ── FIX 3: Absolute vertical anchor — iris Y relative to nose tip ────────────
+  // Nose tip is a stable face landmark unaffected by eyelid position.
+  // This gives the regression a non-lid-dependent vertical signal that
+  // extrapolates naturally beyond the calibration target range (e.g. looking
+  // above the top of the screen).
   const nose = lm[LM.NOSE_TIP];
   const lc   = lm[LM.L_CHEEK], rc = lm[LM.R_CHEEK];
   const fh_  = lm[LM.FOREHEAD], chin = lm[LM.CHIN];
@@ -71,10 +86,23 @@ function extractFeatures(lm) {
   const yaw   = (nose.x - fcx) / fw;
   const pitch = (nose.y - fvy) / fvh;
 
+  // Signed vertical distance from each iris to the nose tip, face-height normalised.
+  // When looking up: iris moves up → this value becomes more negative → model can
+  // extrapolate a prediction of y < 0.05 reliably.
+  const lIrisNoseY = (li.y - nose.y) / fvh;
+  const rIrisNoseY = (ri.y - nose.y) / fvh;
+
   const faceScale = dist(li, ri);
   const avgIrisY  = (li.y + ri.y) / 2;
 
-  return [lOffX, lOffY, rOffX, rOffY, yaw, pitch, faceScale, avgIrisY];
+  // 12 features (was 8). Polynomial expansion will be ~91 terms (manageable).
+  return [
+    lOffX, lOffY, rOffX, rOffY,    // iris-in-socket offsets (fixed normalization)
+    lIrisNoseY, rIrisNoseY,          // absolute vertical anchor (new — key for up/down range)
+    yaw, pitch,                       // head pose
+    faceScale, avgIrisY,             // global scale / absolute position
+    lw, rw,                           // eye width (scale reference, helps cross-terms)
+  ];
 }
 
 function polyFeatures(f) {
@@ -122,10 +150,14 @@ function ridgeRegression(X, y, lambda = 0.01) {
   return b;
 }
 
+// ─── FIX 4: Higher lambda for Y regression ────────────────────────────────────
+// Vertical needs stronger regularisation so it generalises beyond the
+// y=0.05..0.95 calibration range (i.e. looking above/below the screen).
+// Horizontal is fine with tighter fit (lambda=0.01).
 function trainModel(samples) {
   const X  = samples.map(s => polyFeatures(s.features));
-  const bx = ridgeRegression(X, samples.map(s => s.sx));
-  const by = ridgeRegression(X, samples.map(s => s.sy));
+  const bx = ridgeRegression(X, samples.map(s => s.sx), 0.01);
+  const by = ridgeRegression(X, samples.map(s => s.sy), 0.05);
   return { bx, by };
 }
 
@@ -135,7 +167,9 @@ function predict(model, features) {
   const sy = Array.from(model.by).reduce((s, b, i) => s + b * v[i], 0);
   return {
     x: Math.max(0.01, Math.min(0.99, sx)),
-    y: Math.max(0.01, Math.min(0.99, sy)),
+    // ── FIX 5: Allow slight over/under-shoot so extreme gaze hits the edge ──
+    // Display code clamps to screen bounds separately.
+    y: Math.max(-0.05, Math.min(1.05, sy)),
   };
 }
 
@@ -254,8 +288,8 @@ export default function EyeTracker() {
   const canvasRef       = useRef(null);
   const heatCanvasRef   = useRef(null);
   const heatDisplayRef  = useRef(null);
-  const fmRef           = useRef(null);   // ← created ONCE, never closed
-  const camRef          = useRef(null);   // ← stopped/restarted freely
+  const fmRef           = useRef(null);
+  const camRef          = useRef(null);
   const smootherRef     = useRef(new AdaptiveSmoother());
   const modelRef        = useRef(null);
   const chunkRef        = useRef(makeChunk());
@@ -415,7 +449,11 @@ export default function EyeTracker() {
       const smooth = smootherRef.current.get();
       if (!smooth) return;
 
-      const z = getZone(smooth.x, smooth.y);
+      // Clamp for display only — allow the smoother to track near-edge values
+      const displayX = Math.max(0.01, Math.min(0.99, smooth.x));
+      const displayY = Math.max(0.01, Math.min(0.99, smooth.y));
+
+      const z = getZone(displayX, displayY);
 
       const b = blinkRef.current;
       if (ear < 0.21) {
@@ -429,10 +467,10 @@ export default function EyeTracker() {
       chunkRef.current.earN   += 1;
       chunkRef.current.zones[z] = (chunkRef.current.zones[z]||0) + 1;
       if (chunkRef.current.earN % 8 === 0) {
-        chunkRef.current.trail.push({ x:+smooth.x.toFixed(3), y:+smooth.y.toFixed(3) });
+        chunkRef.current.trail.push({ x:+displayX.toFixed(3), y:+displayY.toFixed(3) });
       }
-      heatPointsRef.current.push({ x: smooth.x, y: smooth.y });
-      setGaze({ ...smooth });
+      heatPointsRef.current.push({ x: displayX, y: displayY });
+      setGaze({ x: displayX, y: displayY });
       setZone(z);
     }
   }, []);
@@ -451,10 +489,8 @@ export default function EyeTracker() {
     heatPointsRef.current   = [];
     setChunks([]); setGaze(null); setZone("—");
 
-    // ── Stop camera only — NEVER close FaceMesh ──────────────────────────
     if (camRef.current) { camRef.current.stop(); camRef.current = null; }
 
-    // ── Create FaceMesh exactly ONCE per page load ────────────────────────
     if (!fmRef.current) {
       fmRef.current = new window.FaceMesh({
         locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`,
@@ -464,7 +500,6 @@ export default function EyeTracker() {
         minDetectionConfidence: 0.75, minTrackingConfidence: 0.75,
       });
     }
-    // Always re-register callback (safe to call multiple times)
     fmRef.current.onResults(onResults);
 
     camRef.current = new window.Camera(videoRef.current, {
@@ -497,7 +532,6 @@ export default function EyeTracker() {
   const stop = useCallback(() => {
     clearInterval(timerRef.current);
     clearInterval(calibTimerRef.current);
-    // Stop camera only — leave FaceMesh alive for next session
     if (camRef.current) { camRef.current.stop(); camRef.current = null; }
     modelRef.current = null;
 
@@ -517,7 +551,6 @@ export default function EyeTracker() {
     clearInterval(timerRef.current);
     clearInterval(calibTimerRef.current);
     cancelAnimationFrame(heatAnimRef.current);
-    // Stop camera — FaceMesh WASM cleaned up by browser on page unload
     if (camRef.current) camRef.current.stop();
   }, []);
 
@@ -716,7 +749,6 @@ export default function EyeTracker() {
             ) : isCalib ? (
               <Btn color="#ef4444" onClick={() => {
                 clearInterval(calibTimerRef.current);
-                // Stop camera only — do NOT touch fmRef
                 if (camRef.current) { camRef.current.stop(); camRef.current = null; }
                 setMode("idle");
               }}>Cancel</Btn>
@@ -849,7 +881,6 @@ function ResultsPanel({ chunks, heatPoints = [], onRetry, onDownload }) {
   const s          = buildSummary(chunks);
   const heatResRef = useRef(null);
   const heatOffRef = useRef(null);
-  // const trail      = chunks.filter(c=>c.gazeCenter).map(c=>({ x:c.gazeCenter.x, y:c.gazeCenter.y, zone:c.zone, susp:c.suspicion, label:c.timeLabel }));
 
   useEffect(() => {
     const dc = heatResRef.current;
@@ -907,7 +938,6 @@ function ResultsPanel({ chunks, heatPoints = [], onRetry, onDownload }) {
       </div>
 
       <div style={{ padding:"18px 20px",maxWidth:1100,margin:"0 auto" }}>
-        {/* Stats row */}
         <div style={{ display:"flex",gap:10,marginBottom:18,flexWrap:"wrap" }}>
           <div style={{ background:`${s.verdictColor}10`,border:`1px solid ${s.verdictColor}40`,borderRadius:10,padding:"14px 22px",textAlign:"center",minWidth:150 }}>
             <div style={{ fontSize:10,color:"#9ca3af",marginBottom:4,textTransform:"uppercase",letterSpacing:1 }}>Verdict</div>
@@ -931,7 +961,6 @@ function ResultsPanel({ chunks, heatPoints = [], onRetry, onDownload }) {
         </div>
 
         <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14 }}>
-          {/* Zone breakdown */}
           <div style={{ border:"1px solid #e5e7eb",borderRadius:10,padding:14 }}>
             <div style={{ fontSize:10,color:"#6b7280",textTransform:"uppercase",letterSpacing:1,marginBottom:10 }}>Zone breakdown</div>
             {Object.entries(s.zc).sort((a,b)=>b[1]-a[1]).map(([z,n])=>{
@@ -951,7 +980,6 @@ function ResultsPanel({ chunks, heatPoints = [], onRetry, onDownload }) {
             })}
           </div>
 
-          {/* Heatmap */}
           <div style={{ border:"1px solid #e5e7eb",borderRadius:10,padding:14 }}>
             <div style={{ fontSize:10,color:"#6b7280",textTransform:"uppercase",letterSpacing:1,marginBottom:8 }}>
               Gaze heatmap — full session ({heatPoints.length} points)
@@ -984,7 +1012,6 @@ function ResultsPanel({ chunks, heatPoints = [], onRetry, onDownload }) {
           </div>
         </div>
 
-        {/* Suspicion timeline */}
         <div style={{ border:"1px solid #e5e7eb",borderRadius:10,padding:14,marginBottom:14 }}>
           <div style={{ fontSize:10,color:"#6b7280",textTransform:"uppercase",letterSpacing:1,marginBottom:8 }}>Suspicion timeline</div>
           <div style={{ display:"flex",gap:2,alignItems:"flex-end",height:52 }}>
@@ -998,7 +1025,6 @@ function ResultsPanel({ chunks, heatPoints = [], onRetry, onDownload }) {
           </div>
         </div>
 
-        {/* All chunks table */}
         <div style={{ border:"1px solid #e5e7eb",borderRadius:10,padding:14 }}>
           <div style={{ fontSize:10,color:"#6b7280",textTransform:"uppercase",letterSpacing:1,marginBottom:8 }}>All chunks</div>
           <div style={{ maxHeight:240,overflowY:"auto" }}>
